@@ -13,6 +13,8 @@
 
 static int validate_node(const cJSON *data, const cJSON *schema,
                          const cJSON *res_root, const char *base_uri);
+static int validate_node_inner(const cJSON *data, const cJSON *schema,
+                               const cJSON *res_root, const char *base_uri);
 
 static int utf8_codepoint_count(const char *s) {
     int len = 0;
@@ -222,8 +224,13 @@ static const cJSON *find_anchor(const cJSON *node, const char *name, int at_root
     if (cJSON_IsObject(node)) {
         if (!at_root && cJSON_GetObjectItemCaseSensitive(node, "$id"))
             return NULL;
+        /* A $dynamicAnchor also acts as a plain $anchor for normal $ref/anchor
+           lookups, so match both keywords here. */
         const cJSON *a = cJSON_GetObjectItemCaseSensitive(node, "$anchor");
         if (cJSON_IsString(a) && strcmp(a->valuestring, name) == 0)
+            return node;
+        const cJSON *da = cJSON_GetObjectItemCaseSensitive(node, "$dynamicAnchor");
+        if (cJSON_IsString(da) && strcmp(da->valuestring, name) == 0)
             return node;
         const cJSON *child;
         cJSON_ArrayForEach(child, node) {
@@ -240,8 +247,51 @@ static const cJSON *find_anchor(const cJSON *node, const char *name, int at_root
     return NULL;
 }
 
-static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
-                                const char *ref) {
+/* Find a $dynamicAnchor with the given name within a single schema resource,
+   without crossing into nested $id resources. */
+static const cJSON *find_dynamic_anchor(const cJSON *node, const char *name,
+                                        int at_root) {
+    if (!node) return NULL;
+    if (cJSON_IsObject(node)) {
+        if (!at_root && cJSON_GetObjectItemCaseSensitive(node, "$id"))
+            return NULL;
+        const cJSON *da = cJSON_GetObjectItemCaseSensitive(node, "$dynamicAnchor");
+        if (cJSON_IsString(da) && strcmp(da->valuestring, name) == 0)
+            return node;
+        const cJSON *child;
+        cJSON_ArrayForEach(child, node) {
+            const cJSON *found = find_dynamic_anchor(child, name, 0);
+            if (found) return found;
+        }
+    } else if (cJSON_IsArray(node)) {
+        const cJSON *child;
+        cJSON_ArrayForEach(child, node) {
+            const cJSON *found = find_dynamic_anchor(child, name, 0);
+            if (found) return found;
+        }
+    }
+    return NULL;
+}
+
+/* Dynamic scope stack: one frame per schema resource root entered along the
+   current evaluation path (document root or any subschema bearing $id). Used to
+   resolve $dynamicRef (2020-12) and $recursiveRef (2019-09). */
+#define MAX_DYN_SCOPE 256
+typedef struct {
+    const cJSON *root;     /* resource root node */
+    const char *base_uri;  /* canonical base URI of that resource */
+} DynFrame;
+static struct { DynFrame f[MAX_DYN_SCOPE]; int n; } g_dyn;
+
+/* Resolve a $ref/$dynamicRef. When out_root/out_base are non-NULL, they are set
+   to the schema resource the target belongs to (its root node and canonical base
+   URI), so callers can correctly switch resource scope even when the target node
+   itself does not carry a $id. They default to the current res_root/base_uri. */
+static const cJSON *resolve_ref_ex(const cJSON *res_root, const char *base_uri,
+                                   const char *ref, const cJSON **out_root,
+                                   char *out_base, size_t out_base_sz) {
+    if (out_root) *out_root = res_root;
+    if (out_base) { strncpy(out_base, base_uri, out_base_sz - 1); out_base[out_base_sz - 1] = '\0'; }
     if (!ref) return NULL;
 
     if (ref[0] == '#') {
@@ -289,6 +339,12 @@ static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
 #endif
     if (!target) return NULL;
 
+    /* The target lives in the resource identified by `canonical`; report that
+       resource as the new scope even when the final node (reached via pointer or
+       anchor below) has no $id of its own. */
+    if (out_root) *out_root = target;
+    if (out_base) { strncpy(out_base, canonical, out_base_sz - 1); out_base[out_base_sz - 1] = '\0'; }
+
     if (hash && hash[1] != '\0') {
         if (hash[1] == '/') return resolve_json_pointer(target, hash + 1);
         return find_anchor(target, hash + 1, 1);
@@ -296,8 +352,48 @@ static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
     return target;
 }
 
+static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
+                                const char *ref) {
+    return resolve_ref_ex(res_root, base_uri, ref, NULL, NULL, 0);
+}
+
+/* Wrapper that maintains the dynamic scope stack. A frame is pushed whenever
+   evaluation enters a schema resource root: the top-level call, or a node that
+   carries a $id (which becomes its own resource root). The frame is popped
+   before returning so the stack mirrors the live evaluation path. */
 static int validate_node(const cJSON *data, const cJSON *schema,
                          const cJSON *res_root, const char *base_uri) {
+    if (!cJSON_IsObject(schema)) return validate_node_inner(data, schema, res_root, base_uri);
+
+    const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
+    /* This node is a schema resource root if it carries a $id (and that $id is
+       not suppressed by a sibling $ref under legacy semantics), in which case it
+       becomes its own resource root with its own base URI. */
+    int is_root = cJSON_IsString(id) && !(g_legacy_ref && cJSON_IsString(ref));
+    const cJSON *frame_root = is_root ? schema : res_root;
+    const char *frame_base = is_root ? canonical_of(schema) : base_uri;
+
+    /* Push a frame whenever evaluation enters a resource root that differs from
+       the one already on top of the stack (covers the top-level call and any
+       crossing into a $id-bearing resource). */
+    int pushed = 0;
+    if ((g_dyn.n == 0 || g_dyn.f[g_dyn.n - 1].root != frame_root) &&
+        g_dyn.n < MAX_DYN_SCOPE) {
+        g_dyn.f[g_dyn.n].root = frame_root;
+        g_dyn.f[g_dyn.n].base_uri = frame_base;
+        g_dyn.n++;
+        pushed = 1;
+    }
+
+    int ok = validate_node_inner(data, schema, res_root, base_uri);
+
+    if (pushed) g_dyn.n--;
+    return ok;
+}
+
+static int validate_node_inner(const cJSON *data, const cJSON *schema,
+                               const cJSON *res_root, const char *base_uri) {
     if (cJSON_IsTrue(schema)) return 1;
     if (cJSON_IsFalse(schema)) return 0;
 
@@ -316,13 +412,80 @@ static int validate_node(const cJSON *data, const cJSON *schema,
     }
 
     if (cJSON_IsString(ref)) {
-        const cJSON *resolved = resolve_ref(res_root, base_uri, ref->valuestring);
+        const cJSON *rsrc_root; char rsrc_base[MAX_URI];
+        const cJSON *resolved = resolve_ref_ex(res_root, base_uri, ref->valuestring,
+                                               &rsrc_root, rsrc_base, sizeof(rsrc_base));
         if (resolved) {
             const cJSON *rid = cJSON_GetObjectItemCaseSensitive(resolved, "$id");
-            const cJSON *new_root = cJSON_IsString(rid) ? resolved : res_root;
-            const char *new_base = cJSON_IsString(rid) ? canonical_of(resolved) : base_uri;
+            const cJSON *new_root = cJSON_IsString(rid) ? resolved : rsrc_root;
+            const char *new_base = cJSON_IsString(rid) ? canonical_of(resolved) : rsrc_base;
             if (!validate_node(data, resolved, new_root, new_base)) return 0;
         }
+    }
+
+    /* $dynamicRef (2020-12). Lexically resolve like $ref; if that target's
+       resource defines a matching $dynamicAnchor, redirect to the outermost
+       $dynamicAnchor of that name currently in dynamic scope. Otherwise behave
+       exactly like $ref. */
+    const cJSON *dref = cJSON_GetObjectItemCaseSensitive(schema, "$dynamicRef");
+    if (cJSON_IsString(dref)) {
+        const cJSON *rsrc_root; char rsrc_base[MAX_URI];
+        const cJSON *target = resolve_ref_ex(res_root, base_uri, dref->valuestring,
+                                             &rsrc_root, rsrc_base, sizeof(rsrc_base));
+        if (target) {
+            /* Determine the anchor name from the fragment, if any. */
+            const char *hash = strrchr(dref->valuestring, '#');
+            const char *name = (hash && hash[1] && hash[1] != '/') ? hash + 1 : NULL;
+            /* Bookending: only do dynamic resolution if the lexical target is
+               itself a $dynamicAnchor with this name. */
+            const cJSON *da = cJSON_GetObjectItemCaseSensitive(target, "$dynamicAnchor");
+            if (name && cJSON_IsString(da) && strcmp(da->valuestring, name) == 0) {
+                for (int i = 0; i < g_dyn.n; i++) {
+                    const cJSON *found = find_dynamic_anchor(g_dyn.f[i].root, name, 1);
+                    if (found) {
+                        target = found;
+                        rsrc_root = g_dyn.f[i].root;
+                        strncpy(rsrc_base, g_dyn.f[i].base_uri, sizeof(rsrc_base) - 1);
+                        rsrc_base[sizeof(rsrc_base) - 1] = '\0';
+                        break;
+                    }
+                }
+            }
+            const cJSON *rid = cJSON_GetObjectItemCaseSensitive(target, "$id");
+            const cJSON *new_root = cJSON_IsString(rid) ? target : rsrc_root;
+            const char *new_base = cJSON_IsString(rid) ? canonical_of(target) : rsrc_base;
+            if (!validate_node(data, target, new_root, new_base)) return 0;
+        }
+    }
+
+    /* $recursiveRef (2019-09). Resolve "#" to the current resource root; if a
+       $recursiveAnchor:true is in effect, redirect to the outermost dynamic
+       scope frame whose resource root has $recursiveAnchor:true. */
+    const cJSON *rref = cJSON_GetObjectItemCaseSensitive(schema, "$recursiveRef");
+    if (cJSON_IsString(rref)) {
+        const cJSON *target = resolve_ref(res_root, base_uri, rref->valuestring);
+        const cJSON *new_root = res_root;
+        const char *new_base = base_uri;
+        if (target) {
+            const cJSON *rid = cJSON_GetObjectItemCaseSensitive(target, "$id");
+            if (cJSON_IsString(rid)) { new_root = target; new_base = canonical_of(target); }
+        }
+        /* Recursion is only enabled when the current resource root carries
+           $recursiveAnchor:true; then redirect to the outermost dynamic scope
+           frame whose resource root also has $recursiveAnchor:true. */
+        const cJSON *cur_anchor = cJSON_GetObjectItemCaseSensitive(res_root, "$recursiveAnchor");
+        if (cJSON_IsTrue(cur_anchor)) {
+            for (int i = 0; i < g_dyn.n; i++) {
+                const cJSON *fa = cJSON_GetObjectItemCaseSensitive(g_dyn.f[i].root, "$recursiveAnchor");
+                if (cJSON_IsTrue(fa)) {
+                    target = g_dyn.f[i].root;
+                    new_root = g_dyn.f[i].root;
+                    new_base = g_dyn.f[i].base_uri;
+                    break;
+                }
+            }
+        }
+        if (target && !validate_node(data, target, new_root, new_base)) return 0;
     }
 
     const cJSON *type_val = cJSON_GetObjectItemCaseSensitive(schema, "type");
@@ -713,6 +876,7 @@ int validate_json_schema(const char *json, const char *schema_str) {
     if (!schema) { cJSON_Delete(data); return 0; }
 
     g_ids.n = 0;
+    g_dyn.n = 0;
 
     /* Determine whether $ref ignores a sibling $id (draft-03/04/06/07) or applies
        alongside it (draft 2019-09+), based on the declared $schema dialect.
