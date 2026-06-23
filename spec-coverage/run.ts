@@ -15,6 +15,13 @@ const GITHUB_API =
   'https://api.github.com/repos/json-schema-org/JSON-Schema-Test-Suite/contents/tests';
 const GITHUB_RAW =
   'https://raw.githubusercontent.com/json-schema-org/JSON-Schema-Test-Suite/main/tests';
+const GITHUB_TREE =
+  'https://api.github.com/repos/json-schema-org/JSON-Schema-Test-Suite/git/trees/main?recursive=1';
+const GITHUB_RAW_ROOT =
+  'https://raw.githubusercontent.com/json-schema-org/JSON-Schema-Test-Suite/main';
+
+const REMOTES_DIR = path.join(SPEC_ROOT, 'remotes');
+const REMOTES_PORT = 1234;
 
 interface KeywordResult {
   keyword: string;
@@ -70,6 +77,58 @@ async function downloadTestFiles(draft: Draft, keywords: string[]) {
     );
   }
   await Promise.all(downloads);
+}
+
+async function ensureRemotes() {
+  // Cache: if the remotes dir already has files, assume it's downloaded.
+  if (existsSync(REMOTES_DIR) && readdirSync(REMOTES_DIR).length > 0) return;
+
+  console.log('Downloading remote reference fixtures (remotes/)...');
+  const res = await fetch(GITHUB_TREE);
+  if (!res.ok) throw new Error(`GitHub tree API error: ${res.status}`);
+  const tree = (await res.json()) as { tree: { path: string; type: string }[] };
+
+  const blobs = tree.tree.filter(
+    (e) => e.type === 'blob' && e.path.startsWith('remotes/')
+  );
+
+  await Promise.all(
+    blobs.map(async (e) => {
+      const rel = e.path.slice('remotes/'.length);
+      const dest = path.join(REMOTES_DIR, rel);
+      if (existsSync(dest)) return;
+      const url = `${GITHUB_RAW_ROOT}/${e.path}`;
+      const r = await fetch(url);
+      if (!r.ok) {
+        console.error(`  Failed to fetch ${url}: ${r.status}`);
+        return;
+      }
+      mkdirSync(path.dirname(dest), { recursive: true });
+      await Bun.write(dest, await r.text());
+    })
+  );
+  console.log(`  Downloaded ${blobs.length} remote fixtures.`);
+}
+
+function startRemotesServer() {
+  return Bun.serve({
+    port: REMOTES_PORT,
+    async fetch(req) {
+      const pathname = decodeURIComponent(new URL(req.url).pathname);
+      const filePath = path.join(REMOTES_DIR, pathname);
+      // Prevent path traversal outside REMOTES_DIR.
+      if (!path.resolve(filePath).startsWith(path.resolve(REMOTES_DIR))) {
+        return new Response('Not Found', { status: 404 });
+      }
+      const file = Bun.file(filePath);
+      if (!(await file.exists())) {
+        return new Response('Not Found', { status: 404 });
+      }
+      return new Response(file, {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
 }
 
 async function compileRunner() {
@@ -171,44 +230,52 @@ async function main() {
   console.log('Compiling native test runner...\n');
   await compileRunner();
 
-  const draftResults: DraftResult[] = [];
-  let grandTotal = 0,
-    grandPassed = 0,
-    grandFailed = 0;
+  await ensureRemotes();
+  const server = startRemotesServer();
+  console.log(`Serving remotes/ fixtures at http://localhost:${REMOTES_PORT}\n`);
 
-  for (const draft of DRAFTS) {
-    console.log(`\nDiscovering test files for ${draft}...`);
-    const keywords = await discoverKeywords(draft);
-    console.log(`  Found ${keywords.length} keywords — downloading...`);
-    await downloadTestFiles(draft, keywords);
+  try {
+    const draftResults: DraftResult[] = [];
+    let grandTotal = 0,
+      grandPassed = 0,
+      grandFailed = 0;
 
-    const result = await runDraft(draft, keywords);
-    draftResults.push(result);
-    grandTotal += result.total;
-    grandPassed += result.passed;
-    grandFailed += result.failed;
+    for (const draft of DRAFTS) {
+      console.log(`\nDiscovering test files for ${draft}...`);
+      const keywords = await discoverKeywords(draft);
+      console.log(`  Found ${keywords.length} keywords — downloading...`);
+      await downloadTestFiles(draft, keywords);
 
-    printDraftResult(result);
+      const result = await runDraft(draft, keywords);
+      draftResults.push(result);
+      grandTotal += result.total;
+      grandPassed += result.passed;
+      grandFailed += result.failed;
+
+      printDraftResult(result);
+    }
+
+    const grandPct = grandTotal > 0 ? ((grandPassed / grandTotal) * 100).toFixed(1) : '0.0';
+    console.log(`\n${'='.repeat(72)}`);
+    console.log('GRAND TOTAL');
+    console.log('='.repeat(72));
+    console.log(
+      `  ${grandPassed}/${grandTotal} tests passed across ${DRAFTS.length} drafts (${grandPct}%)`
+    );
+    console.log(`  ${grandFailed} failures\n`);
+
+    for (const d of draftResults) {
+      const pct = d.total > 0 ? ((d.passed / d.total) * 100).toFixed(1) : '0.0';
+      const icon = d.failed === 0 ? 'PASS' : 'FAIL';
+      console.log(`  [${icon}] ${d.draft.padEnd(16)} ${d.passed}/${d.total} (${pct}%)`);
+    }
+
+    console.log('');
+
+    printDetailedFailures(draftResults);
+  } finally {
+    server.stop();
   }
-
-  const grandPct = grandTotal > 0 ? ((grandPassed / grandTotal) * 100).toFixed(1) : '0.0';
-  console.log(`\n${'='.repeat(72)}`);
-  console.log('GRAND TOTAL');
-  console.log('='.repeat(72));
-  console.log(
-    `  ${grandPassed}/${grandTotal} tests passed across ${DRAFTS.length} drafts (${grandPct}%)`
-  );
-  console.log(`  ${grandFailed} failures\n`);
-
-  for (const d of draftResults) {
-    const pct = d.total > 0 ? ((d.passed / d.total) * 100).toFixed(1) : '0.0';
-    const icon = d.failed === 0 ? 'PASS' : 'FAIL';
-    console.log(`  [${icon}] ${d.draft.padEnd(16)} ${d.passed}/${d.total} (${pct}%)`);
-  }
-
-  console.log('');
-
-  printDetailedFailures(draftResults);
 }
 
 main().catch((e) => {
