@@ -48,6 +48,14 @@ static int is_absolute_uri(const char *s) {
 static void resolve_uri(const char *base, const char *rel, char *out, size_t sz) {
     if (!rel || !rel[0]) { strncpy(out, base, sz - 1); out[sz - 1] = '\0'; return; }
     if (is_absolute_uri(rel)) { strncpy(out, rel, sz - 1); out[sz - 1] = '\0'; return; }
+    /* A fragment-only reference resolves against the full base URI (minus the
+       base's own fragment), keeping the entire base path/authority intact. */
+    if (rel[0] == '#') {
+        const char *base_hash = strchr(base, '#');
+        size_t blen = base_hash ? (size_t)(base_hash - base) : strlen(base);
+        snprintf(out, sz, "%.*s%s", (int)blen, base, rel);
+        return;
+    }
     if (rel[0] == '/') {
         const char *auth = strstr(base, "://");
         if (auth) {
@@ -72,6 +80,13 @@ static void resolve_uri(const char *base, const char *rel, char *out, size_t sz)
 
 typedef struct { char uri[MAX_URI]; const cJSON *schema; } IdEntry;
 static struct { IdEntry e[MAX_IDS]; int n; } g_ids;
+
+/* In draft-03/04/06/07 a $ref ignores all sibling keywords, including a sibling
+   $id (so the $id does not change the base URI for the $ref). In draft 2019-09
+   and later, $id and $ref apply alongside each other. This flag selects the
+   legacy behavior; it is set from the root $schema (defaulting to legacy when no
+   $schema declares a 2019-09+ dialect). */
+static int g_legacy_ref = 1;
 
 static void register_ids(const cJSON *node, const char *base) {
     if (!node || g_ids.n >= MAX_IDS) return;
@@ -232,6 +247,13 @@ static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
     if (ref[0] == '#') {
         if (ref[1] == '\0') return res_root;
         if (ref[1] == '/') return resolve_json_pointer(res_root, ref + 1);
+        /* Plain fragment: could be a location-independent $id (registered as
+           base_uri#name) or a plain $anchor in the current resource. Try the
+           location-independent identifier first. */
+        char full[MAX_URI];
+        resolve_uri(base_uri, ref, full, sizeof(full));
+        const cJSON *byid = lookup_id(full);
+        if (byid) return byid;
         return find_anchor(res_root, ref + 1, 1);
     }
 
@@ -249,6 +271,15 @@ static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
 
     char canonical[MAX_URI];
     resolve_uri(base_uri, ref_base, canonical, sizeof(canonical));
+
+    /* The full reference (including fragment) may itself be a registered
+       location-independent identifier ($id of the form "base#name"). */
+    if (hash && hash[1] != '\0' && hash[1] != '/') {
+        char full[MAX_URI];
+        snprintf(full, sizeof(full), "%s%s", canonical, hash);
+        const cJSON *byid = lookup_id(full);
+        if (byid) return byid;
+    }
 
     const cJSON *target = lookup_id(canonical);
 #ifdef ENABLE_HTTP
@@ -270,15 +301,20 @@ static int validate_node(const cJSON *data, const cJSON *schema,
     if (cJSON_IsTrue(schema)) return 1;
     if (cJSON_IsFalse(schema)) return 0;
 
+    const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
+
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
-    if (cJSON_IsString(id)) {
+    /* A sibling $id does not change the base URI used to resolve a sibling $ref
+       (draft-06/07: "$ref prevents a sibling $id from changing the base uri").
+       Skip the scope change when $ref is present so the $ref resolves against
+       the enclosing base. */
+    if (cJSON_IsString(id) && !(g_legacy_ref && cJSON_IsString(ref))) {
         char resolved[MAX_URI];
         resolve_uri(base_uri, id->valuestring, resolved, sizeof(resolved));
         base_uri = canonical_of(schema);
         res_root = schema;
     }
 
-    const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
     if (cJSON_IsString(ref)) {
         const cJSON *resolved = resolve_ref(res_root, base_uri, ref->valuestring);
         if (resolved) {
@@ -677,6 +713,19 @@ int validate_json_schema(const char *json, const char *schema_str) {
     if (!schema) { cJSON_Delete(data); return 0; }
 
     g_ids.n = 0;
+
+    /* Determine whether $ref ignores a sibling $id (draft-03/04/06/07) or applies
+       alongside it (draft 2019-09+), based on the declared $schema dialect.
+       Default to legacy behavior when no recognizable 2019-09+ dialect is given. */
+    g_legacy_ref = 1;
+    const cJSON *root_schema = cJSON_GetObjectItemCaseSensitive(schema, "$schema");
+    if (cJSON_IsString(root_schema)) {
+        const char *sv = root_schema->valuestring;
+        if (strstr(sv, "2019-09") || strstr(sv, "2020-12") ||
+            strstr(sv, "draft/next"))
+            g_legacy_ref = 0;
+    }
+
     const cJSON *root_id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
     const char *root_base = cJSON_IsString(root_id) ? root_id->valuestring : "";
     register_ids(schema, "");
