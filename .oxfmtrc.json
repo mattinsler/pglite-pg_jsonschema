@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "ignorePatterns": [".*", "node_modules", "dist", "build", "assets", "docs", "public", "*.md"],
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "es5",
+  "sortImports": {},
+  "sortPackageJson": false,
+  "overrides": [
+    {
+      "files": ["*.json"],
+      "options": {
+        "trailingComma": "none"
+      }
+    }
+  ]
+}

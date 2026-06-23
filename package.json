@@ -1,0 +1,38 @@
+{
+  "name": "pglite-pg_jsonschema",
+  "description": "PGlite extension: pg_jsonschema",
+  "version": "0.8.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./drizzle": "./src/drizzle.ts"
+  },
+  "files": [
+    "dist/"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "fmt": "oxfmt",
+    "fmt-check": "oxfmt --check",
+    "lint": "oxlint",
+    "lint-fix": "oxlint --fix",
+    "spec-coverage": "bun spec-coverage/run.ts",
+    "test": "bun test tests/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.3",
+    "@types/bun": "1.3.14",
+    "drizzle-orm": "1.0.0-rc.3",
+    "oxfmt": "0.56.0",
+    "oxlint": "1.71.0",
+    "typescript": "6.0.3",
+    "zod": "4.4.3"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=1.0.0"
+  }
+}
