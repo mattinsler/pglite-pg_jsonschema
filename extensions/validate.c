@@ -11,10 +11,86 @@
 #define MAX_URI 512
 #define MAX_IDS 256
 
+/* Evaluation accumulator for unevaluatedProperties / unevaluatedItems.
+   For a given (data, schema) call it records which property names / item
+   indices were "evaluated" by adjacent or in-place applicators that
+   validated successfully. Each validate_node call owns its own Eval; a
+   parent merges a child's Eval into its own only when the child passed.
+   This per-call ownership is what prevents sibling ("cousin") annotations
+   from leaking across allOf/anyOf branches. */
+typedef struct {
+    char **names;      /* evaluated property names (heap-duplicated) */
+    int names_n;
+    int names_cap;
+    int *items;        /* evaluated item indices (small set) */
+    int items_n;
+    int items_cap;
+} Eval;
+
+static void eval_init(Eval *e) {
+    if (!e) return;
+    e->names = NULL; e->names_n = 0; e->names_cap = 0;
+    e->items = NULL; e->items_n = 0; e->items_cap = 0;
+}
+
+static void eval_free(Eval *e) {
+    if (!e) return;
+    for (int i = 0; i < e->names_n; i++) free(e->names[i]);
+    free(e->names);
+    free(e->items);
+    eval_init(e);
+}
+
+static int eval_has_name(const Eval *e, const char *name) {
+    if (!e) return 0;
+    for (int i = 0; i < e->names_n; i++)
+        if (strcmp(e->names[i], name) == 0) return 1;
+    return 0;
+}
+
+static void eval_add_name(Eval *e, const char *name) {
+    if (!e || eval_has_name(e, name)) return;
+    if (e->names_n >= e->names_cap) {
+        int nc = e->names_cap ? e->names_cap * 2 : 8;
+        char **np = realloc(e->names, (size_t)nc * sizeof(char *));
+        if (!np) return;
+        e->names = np; e->names_cap = nc;
+    }
+    e->names[e->names_n++] = strdup(name);
+}
+
+static int eval_has_item(const Eval *e, int idx) {
+    if (!e) return 0;
+    for (int i = 0; i < e->items_n; i++)
+        if (e->items[i] == idx) return 1;
+    return 0;
+}
+
+static void eval_add_item(Eval *e, int idx) {
+    if (!e || eval_has_item(e, idx)) return;
+    if (e->items_n >= e->items_cap) {
+        int nc = e->items_cap ? e->items_cap * 2 : 8;
+        int *np = realloc(e->items, (size_t)nc * sizeof(int));
+        if (!np) return;
+        e->items = np; e->items_cap = nc;
+    }
+    e->items[e->items_n++] = idx;
+}
+
+static void eval_merge(Eval *dst, const Eval *src) {
+    if (!dst || !src) return;
+    for (int i = 0; i < src->names_n; i++) eval_add_name(dst, src->names[i]);
+    for (int i = 0; i < src->items_n; i++) eval_add_item(dst, src->items[i]);
+}
+
 static int validate_node(const cJSON *data, const cJSON *schema,
                          const cJSON *res_root, const char *base_uri);
+static int validate_node_ev(const cJSON *data, const cJSON *schema,
+                            const cJSON *res_root, const char *base_uri,
+                            Eval *ev);
 static int validate_node_inner(const cJSON *data, const cJSON *schema,
-                               const cJSON *res_root, const char *base_uri);
+                               const cJSON *res_root, const char *base_uri,
+                               Eval *ev);
 
 static int utf8_codepoint_count(const char *s) {
     int len = 0;
@@ -363,7 +439,20 @@ static const cJSON *resolve_ref(const cJSON *res_root, const char *base_uri,
    before returning so the stack mirrors the live evaluation path. */
 static int validate_node(const cJSON *data, const cJSON *schema,
                          const cJSON *res_root, const char *base_uri) {
-    if (!cJSON_IsObject(schema)) return validate_node_inner(data, schema, res_root, base_uri);
+    /* The caller does not need this node's evaluation set, but the node may
+       itself contain unevaluatedProperties/unevaluatedItems that must be
+       processed against its OWN local accumulator. Give it a private Eval so
+       those keywords run; it is not propagated upward (cousins stay isolated). */
+    Eval lev; eval_init(&lev);
+    int ok = validate_node_ev(data, schema, res_root, base_uri, &lev);
+    eval_free(&lev);
+    return ok;
+}
+
+static int validate_node_ev(const cJSON *data, const cJSON *schema,
+                            const cJSON *res_root, const char *base_uri,
+                            Eval *ev) {
+    if (!cJSON_IsObject(schema)) return validate_node_inner(data, schema, res_root, base_uri, ev);
 
     const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
@@ -386,14 +475,15 @@ static int validate_node(const cJSON *data, const cJSON *schema,
         pushed = 1;
     }
 
-    int ok = validate_node_inner(data, schema, res_root, base_uri);
+    int ok = validate_node_inner(data, schema, res_root, base_uri, ev);
 
     if (pushed) g_dyn.n--;
     return ok;
 }
 
 static int validate_node_inner(const cJSON *data, const cJSON *schema,
-                               const cJSON *res_root, const char *base_uri) {
+                               const cJSON *res_root, const char *base_uri,
+                               Eval *ev) {
     if (cJSON_IsTrue(schema)) return 1;
     if (cJSON_IsFalse(schema)) return 0;
 
@@ -419,7 +509,11 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
             const cJSON *rid = cJSON_GetObjectItemCaseSensitive(resolved, "$id");
             const cJSON *new_root = cJSON_IsString(rid) ? resolved : rsrc_root;
             const char *new_base = cJSON_IsString(rid) ? canonical_of(resolved) : rsrc_base;
-            if (!validate_node(data, resolved, new_root, new_base)) return 0;
+            Eval cev; eval_init(&cev);
+            int ok = validate_node_ev(data, resolved, new_root, new_base, &cev);
+            if (ok && ev) eval_merge(ev, &cev);
+            eval_free(&cev);
+            if (!ok) return 0;
         }
     }
 
@@ -454,7 +548,11 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
             const cJSON *rid = cJSON_GetObjectItemCaseSensitive(target, "$id");
             const cJSON *new_root = cJSON_IsString(rid) ? target : rsrc_root;
             const char *new_base = cJSON_IsString(rid) ? canonical_of(target) : rsrc_base;
-            if (!validate_node(data, target, new_root, new_base)) return 0;
+            Eval cev; eval_init(&cev);
+            int ok = validate_node_ev(data, target, new_root, new_base, &cev);
+            if (ok && ev) eval_merge(ev, &cev);
+            eval_free(&cev);
+            if (!ok) return 0;
         }
     }
 
@@ -485,7 +583,13 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                 }
             }
         }
-        if (target && !validate_node(data, target, new_root, new_base)) return 0;
+        if (target) {
+            Eval cev; eval_init(&cev);
+            int ok = validate_node_ev(data, target, new_root, new_base, &cev);
+            if (ok && ev) eval_merge(ev, &cev);
+            eval_free(&cev);
+            if (!ok) return 0;
+        }
     }
 
     const cJSON *type_val = cJSON_GetObjectItemCaseSensitive(schema, "type");
@@ -522,7 +626,11 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
     if (cJSON_IsArray(all_of)) {
         const cJSON *sub;
         cJSON_ArrayForEach(sub, all_of) {
-            if (!validate_node(data, sub, res_root, base_uri)) return 0;
+            Eval cev; eval_init(&cev);
+            int ok = validate_node_ev(data, sub, res_root, base_uri, &cev);
+            if (ok && ev) eval_merge(ev, &cev);
+            eval_free(&cev);
+            if (!ok) return 0;
         }
     }
 
@@ -541,7 +649,16 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
         int matched = 0;
         const cJSON *sub;
         cJSON_ArrayForEach(sub, any_of) {
-            if (validate_node(data, sub, res_root, base_uri)) { matched = 1; break; }
+            if (ev) {
+                Eval cev; eval_init(&cev);
+                int ok = validate_node_ev(data, sub, res_root, base_uri, &cev);
+                if (ok) { matched = 1; eval_merge(ev, &cev); }
+                eval_free(&cev);
+                /* Keep evaluating remaining branches so all successful ones
+                   contribute their annotations. */
+            } else {
+                if (validate_node(data, sub, res_root, base_uri)) { matched = 1; break; }
+            }
         }
         if (!matched) return 0;
     }
@@ -549,11 +666,25 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
     const cJSON *one_of = cJSON_GetObjectItemCaseSensitive(schema, "oneOf");
     if (cJSON_IsArray(one_of)) {
         int count = 0;
+        Eval oev; eval_init(&oev);
         const cJSON *sub;
         cJSON_ArrayForEach(sub, one_of) {
-            if (validate_node(data, sub, res_root, base_uri)) count++;
-            if (count > 1) break;
+            if (ev) {
+                Eval cev; eval_init(&cev);
+                int ok = validate_node_ev(data, sub, res_root, base_uri, &cev);
+                if (ok) {
+                    count++;
+                    if (count == 1) eval_merge(&oev, &cev);
+                }
+                eval_free(&cev);
+                if (count > 1) break;
+            } else {
+                if (validate_node(data, sub, res_root, base_uri)) count++;
+                if (count > 1) break;
+            }
         }
+        if (count == 1 && ev) eval_merge(ev, &oev);
+        eval_free(&oev);
         if (count != 1) return 0;
     }
 
@@ -597,6 +728,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
             cJSON_ArrayForEach(ps, properties) {
                 const cJSON *pd = cJSON_GetObjectItemCaseSensitive(data, ps->string);
                 if (pd && !validate_node(pd, ps, res_root, base_uri)) return 0;
+                if (pd) eval_add_name(ev, ps->string);
             }
         }
 
@@ -617,9 +749,11 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                 if (regcomp(&re, pp->string, REG_EXTENDED | REG_NOSUB) != 0) continue;
                 const cJSON *dp;
                 cJSON_ArrayForEach(dp, data) {
-                    if (regexec(&re, dp->string, 0, NULL, 0) == 0 &&
-                        !validate_node(dp, pp, res_root, base_uri)) {
-                        regfree(&re); return 0;
+                    if (regexec(&re, dp->string, 0, NULL, 0) == 0) {
+                        if (!validate_node(dp, pp, res_root, base_uri)) {
+                            regfree(&re); return 0;
+                        }
+                        eval_add_name(ev, dp->string);
                     }
                 }
                 regfree(&re);
@@ -644,6 +778,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                     if (matched_pat) continue;
                 }
                 if (!validate_node(dp, additional, res_root, base_uri)) return 0;
+                eval_add_name(ev, dp->string);
             }
         }
 
@@ -678,9 +813,12 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
         if (cJSON_IsObject(dep_schemas)) {
             const cJSON *dep;
             cJSON_ArrayForEach(dep, dep_schemas) {
-                if (cJSON_HasObjectItem(data, dep->string) &&
-                    !validate_node(data, dep, res_root, base_uri))
-                    return 0;
+                if (!cJSON_HasObjectItem(data, dep->string)) continue;
+                Eval cev; eval_init(&cev);
+                int ok = validate_node_ev(data, dep, res_root, base_uri, &cev);
+                if (ok && ev) eval_merge(ev, &cev);
+                eval_free(&cev);
+                if (!ok) return 0;
             }
         }
 
@@ -700,8 +838,11 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                     if (!cJSON_HasObjectItem(data, dep->valuestring))
                         return 0;
                 } else if (cJSON_IsObject(dep) || cJSON_IsBool(dep)) {
-                    if (!validate_node(data, dep, res_root, base_uri))
-                        return 0;
+                    Eval cev; eval_init(&cev);
+                    int ok = validate_node_ev(data, dep, res_root, base_uri, &cev);
+                    if (ok && ev) eval_merge(ev, &cev);
+                    eval_free(&cev);
+                    if (!ok) return 0;
                 }
             }
         }
@@ -720,6 +861,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                 if (idx >= prefix_count) break;
                 const cJSON *is = cJSON_GetArrayItem(prefix_items, idx);
                 if (is && !validate_node(elem, is, res_root, base_uri)) return 0;
+                eval_add_item(ev, idx);
                 idx++;
             }
         }
@@ -735,6 +877,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                     if (idx >= tuple_count) break;
                     const cJSON *is = cJSON_GetArrayItem(items, idx);
                     if (is && !validate_node(elem, is, res_root, base_uri)) return 0;
+                    eval_add_item(ev, idx);
                     idx++;
                 }
 
@@ -748,6 +891,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                         cJSON_ArrayForEach(elem, data) {
                             if (idx++ < tuple_count) continue;
                             if (!validate_node(elem, additional_items, res_root, base_uri)) return 0;
+                            eval_add_item(ev, idx - 1);
                         }
                     }
                 }
@@ -757,8 +901,10 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
                 int idx = 0;
                 const cJSON *elem;
                 cJSON_ArrayForEach(elem, data) {
-                    if (idx++ < prefix_count) continue;
+                    if (idx < prefix_count) { idx++; continue; }
                     if (!validate_node(elem, items, res_root, base_uri)) return 0;
+                    eval_add_item(ev, idx);
+                    idx++;
                 }
             }
         }
@@ -781,9 +927,14 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
         const cJSON *contains = cJSON_GetObjectItemCaseSensitive(schema, "contains");
         if (contains) {
             int mc = 0;
+            int idx = 0;
             const cJSON *elem;
             cJSON_ArrayForEach(elem, data) {
-                if (validate_node(elem, contains, res_root, base_uri)) mc++;
+                if (validate_node(elem, contains, res_root, base_uri)) {
+                    mc++;
+                    eval_add_item(ev, idx);
+                }
+                idx++;
             }
             const cJSON *min_c = cJSON_GetObjectItemCaseSensitive(schema, "minContains");
             const cJSON *max_c = cJSON_GetObjectItemCaseSensitive(schema, "maxContains");
@@ -856,12 +1007,60 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
 
     const cJSON *if_s = cJSON_GetObjectItemCaseSensitive(schema, "if");
     if (if_s) {
-        if (validate_node(data, if_s, res_root, base_uri)) {
+        Eval iev; eval_init(&iev);
+        int if_ok = validate_node_ev(data, if_s, res_root, base_uri, &iev);
+        if (if_ok) {
+            /* `if` passed: its annotations and `then`'s annotations apply. */
+            if (ev) eval_merge(ev, &iev);
             const cJSON *then_s = cJSON_GetObjectItemCaseSensitive(schema, "then");
-            if (then_s && !validate_node(data, then_s, res_root, base_uri)) return 0;
+            if (then_s) {
+                Eval tev; eval_init(&tev);
+                int ok = validate_node_ev(data, then_s, res_root, base_uri, &tev);
+                if (ok && ev) eval_merge(ev, &tev);
+                eval_free(&tev);
+                if (!ok) { eval_free(&iev); return 0; }
+            }
         } else {
             const cJSON *else_s = cJSON_GetObjectItemCaseSensitive(schema, "else");
-            if (else_s && !validate_node(data, else_s, res_root, base_uri)) return 0;
+            if (else_s) {
+                Eval eev; eval_init(&eev);
+                int ok = validate_node_ev(data, else_s, res_root, base_uri, &eev);
+                if (ok && ev) eval_merge(ev, &eev);
+                eval_free(&eev);
+                if (!ok) { eval_free(&iev); return 0; }
+            }
+        }
+        eval_free(&iev);
+    }
+
+    /* unevaluatedProperties / unevaluatedItems run last: every adjacent and
+       in-place applicator above has contributed to `ev`. They validate each
+       not-yet-evaluated property/item and, on success, mark it evaluated so an
+       enclosing unevaluated* (which merges this call's ev) also sees it. */
+    if (ev) {
+        const cJSON *uneval_props =
+            cJSON_GetObjectItemCaseSensitive(schema, "unevaluatedProperties");
+        if (uneval_props && cJSON_IsObject(data)) {
+            const cJSON *dp;
+            cJSON_ArrayForEach(dp, data) {
+                if (eval_has_name(ev, dp->string)) continue;
+                if (!validate_node(dp, uneval_props, res_root, base_uri)) return 0;
+                eval_add_name(ev, dp->string);
+            }
+        }
+
+        const cJSON *uneval_items =
+            cJSON_GetObjectItemCaseSensitive(schema, "unevaluatedItems");
+        if (uneval_items && cJSON_IsArray(data)) {
+            int idx = 0;
+            const cJSON *elem;
+            cJSON_ArrayForEach(elem, data) {
+                if (!eval_has_item(ev, idx)) {
+                    if (!validate_node(elem, uneval_items, res_root, base_uri)) return 0;
+                    eval_add_item(ev, idx);
+                }
+                idx++;
+            }
         }
     }
 
@@ -894,7 +1093,9 @@ int validate_json_schema(const char *json, const char *schema_str) {
     const char *root_base = cJSON_IsString(root_id) ? root_id->valuestring : "";
     register_ids(schema, "");
 
-    int result = validate_node(data, schema, schema, root_base);
+    Eval rev; eval_init(&rev);
+    int result = validate_node_ev(data, schema, schema, root_base, &rev);
+    eval_free(&rev);
 
     cJSON_Delete(data);
     cJSON_Delete(schema);
