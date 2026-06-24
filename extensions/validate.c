@@ -159,18 +159,55 @@ static void resolve_uri(const char *base, const char *rel, char *out, size_t sz)
 typedef struct { char uri[MAX_URI]; const cJSON *schema; } IdEntry;
 static struct { IdEntry e[MAX_IDS]; int n; } g_ids;
 
+/* Which JSON Schema draft is being validated. Drives two version-specific
+   behaviors: (1) in draft-03/04/06/07 a $ref ignores all sibling keywords; in
+   2019-09+ $ref applies alongside its siblings; (2) the identifier keyword is
+   the legacy "id" in draft-03/04 and "$id" in draft-06+. The default is the
+   modern dialect so the 2-arg validate_json_schema API keeps current behavior
+   when no draft is set. */
+typedef enum {
+    DRAFT_3,
+    DRAFT_4,
+    DRAFT_6,
+    DRAFT_7,
+    DRAFT_2019_09,
+    DRAFT_2020_12
+} Draft;
+static Draft g_draft = DRAFT_2020_12;
+
 /* In draft-03/04/06/07 a $ref ignores all sibling keywords, including a sibling
    $id (so the $id does not change the base URI for the $ref). In draft 2019-09
-   and later, $id and $ref apply alongside each other. This flag selects the
-   legacy behavior; it is set from the root $schema (defaulting to legacy when no
-   $schema declares a 2019-09+ dialect). */
-static int g_legacy_ref = 1;
+   and later, $id and $ref apply alongside each other. Derived from g_draft. */
+static int g_legacy_ref = 0;
+
+/* In draft-03/04 the identifier keyword is the legacy lowercase "id"; in
+   draft-06+ it is "$id". Returns the keyword name for the current draft. */
+static const char *id_keyword(void) {
+    return (g_draft == DRAFT_3 || g_draft == DRAFT_4) ? "id" : "$id";
+}
+
+static void apply_draft_flags(void) {
+    g_legacy_ref = (g_draft == DRAFT_3 || g_draft == DRAFT_4 ||
+                    g_draft == DRAFT_6 || g_draft == DRAFT_7);
+}
+
+void set_validation_draft(const char *draft) {
+    if (draft) {
+        if (strcmp(draft, "draft3") == 0) g_draft = DRAFT_3;
+        else if (strcmp(draft, "draft4") == 0) g_draft = DRAFT_4;
+        else if (strcmp(draft, "draft6") == 0) g_draft = DRAFT_6;
+        else if (strcmp(draft, "draft7") == 0) g_draft = DRAFT_7;
+        else if (strcmp(draft, "draft2019-09") == 0) g_draft = DRAFT_2019_09;
+        else if (strcmp(draft, "draft2020-12") == 0) g_draft = DRAFT_2020_12;
+    }
+    apply_draft_flags();
+}
 
 static void register_ids(const cJSON *node, const char *base) {
     if (!node || g_ids.n >= MAX_IDS) return;
     if (cJSON_IsObject(node)) {
         const char *cur_base = base;
-        const cJSON *id = cJSON_GetObjectItemCaseSensitive(node, "$id");
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(node, id_keyword());
         if (cJSON_IsString(id)) {
             char canonical[MAX_URI];
             resolve_uri(base, id->valuestring, canonical, sizeof(canonical));
@@ -265,9 +302,20 @@ static int hex_val(char c) {
     return -1;
 }
 
-static const cJSON *resolve_json_pointer(const cJSON *doc, const char *ptr) {
+/* Resolve a JSON pointer against doc, tracking the effective base URI as it
+   descends and applying any $id/id encountered along the path. On success (when
+   out_base is
+   non-NULL) it writes the base URI in effect at the resolved node, so a child
+   relative $ref re-bases against the nearest enclosing identifier rather than
+   only the resource root. */
+static const cJSON *resolve_json_pointer_base(const cJSON *doc, const char *ptr,
+                                              const char *base, char *out_base,
+                                              size_t out_base_sz) {
     if (!ptr || *ptr != '/') return NULL;
     const cJSON *cur = doc;
+    char cur_base[MAX_URI];
+    strncpy(cur_base, base, sizeof(cur_base) - 1);
+    cur_base[sizeof(cur_base) - 1] = '\0';
     char seg[256];
 
     while (*ptr == '/' && cur) {
@@ -291,6 +339,19 @@ static const cJSON *resolve_json_pointer(const cJSON *doc, const char *ptr) {
             cur = cJSON_GetArrayItem(cur, atoi(seg));
         else
             cur = cJSON_GetObjectItemCaseSensitive(cur, seg);
+        if (cur && cJSON_IsObject(cur)) {
+            const cJSON *cid = cJSON_GetObjectItemCaseSensitive(cur, id_keyword());
+            if (cJSON_IsString(cid)) {
+                char resolved[MAX_URI];
+                resolve_uri(cur_base, cid->valuestring, resolved, sizeof(resolved));
+                strncpy(cur_base, resolved, sizeof(cur_base) - 1);
+                cur_base[sizeof(cur_base) - 1] = '\0';
+            }
+        }
+    }
+    if (cur && out_base) {
+        strncpy(out_base, cur_base, out_base_sz - 1);
+        out_base[out_base_sz - 1] = '\0';
     }
     return cur;
 }
@@ -372,7 +433,9 @@ static const cJSON *resolve_ref_ex(const cJSON *res_root, const char *base_uri,
 
     if (ref[0] == '#') {
         if (ref[1] == '\0') return res_root;
-        if (ref[1] == '/') return resolve_json_pointer(res_root, ref + 1);
+        if (ref[1] == '/')
+            return resolve_json_pointer_base(res_root, ref + 1, base_uri,
+                                             out_base, out_base_sz);
         /* Plain fragment: could be a location-independent $id (registered as
            base_uri#name) or a plain $anchor in the current resource. Try the
            location-independent identifier first. */
@@ -422,7 +485,9 @@ static const cJSON *resolve_ref_ex(const cJSON *res_root, const char *base_uri,
     if (out_base) { strncpy(out_base, canonical, out_base_sz - 1); out_base[out_base_sz - 1] = '\0'; }
 
     if (hash && hash[1] != '\0') {
-        if (hash[1] == '/') return resolve_json_pointer(target, hash + 1);
+        if (hash[1] == '/')
+            return resolve_json_pointer_base(target, hash + 1, canonical,
+                                             out_base, out_base_sz);
         return find_anchor(target, hash + 1, 1);
     }
     return target;
@@ -455,7 +520,7 @@ static int validate_node_ev(const cJSON *data, const cJSON *schema,
     if (!cJSON_IsObject(schema)) return validate_node_inner(data, schema, res_root, base_uri, ev);
 
     const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
-    const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, id_keyword());
     /* This node is a schema resource root if it carries a $id (and that $id is
        not suppressed by a sibling $ref under legacy semantics), in which case it
        becomes its own resource root with its own base URI. */
@@ -489,7 +554,7 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
 
     const cJSON *ref = cJSON_GetObjectItemCaseSensitive(schema, "$ref");
 
-    const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(schema, id_keyword());
     /* A sibling $id does not change the base URI used to resolve a sibling $ref
        (draft-06/07: "$ref prevents a sibling $id from changing the base uri").
        Skip the scope change when $ref is present so the $ref resolves against
@@ -505,8 +570,18 @@ static int validate_node_inner(const cJSON *data, const cJSON *schema,
         const cJSON *rsrc_root; char rsrc_base[MAX_URI];
         const cJSON *resolved = resolve_ref_ex(res_root, base_uri, ref->valuestring,
                                                &rsrc_root, rsrc_base, sizeof(rsrc_base));
+        /* In draft-03/04/06/07 a $ref ignores ALL sibling keywords: only the
+           ref is evaluated and its result is the result of this schema. In
+           2019-09+ siblings apply alongside the ref, so fall through. */
+        if (g_legacy_ref) {
+            if (!resolved) return 1;
+            const cJSON *rid = cJSON_GetObjectItemCaseSensitive(resolved, id_keyword());
+            const cJSON *new_root = cJSON_IsString(rid) ? resolved : rsrc_root;
+            const char *new_base = cJSON_IsString(rid) ? canonical_of(resolved) : rsrc_base;
+            return validate_node_ev(data, resolved, new_root, new_base, ev);
+        }
         if (resolved) {
-            const cJSON *rid = cJSON_GetObjectItemCaseSensitive(resolved, "$id");
+            const cJSON *rid = cJSON_GetObjectItemCaseSensitive(resolved, id_keyword());
             const cJSON *new_root = cJSON_IsString(rid) ? resolved : rsrc_root;
             const char *new_base = cJSON_IsString(rid) ? canonical_of(resolved) : rsrc_base;
             Eval cev; eval_init(&cev);
@@ -1077,19 +1152,25 @@ int validate_json_schema(const char *json, const char *schema_str) {
     g_ids.n = 0;
     g_dyn.n = 0;
 
-    /* Determine whether $ref ignores a sibling $id (draft-03/04/06/07) or applies
-       alongside it (draft 2019-09+), based on the declared $schema dialect.
-       Default to legacy behavior when no recognizable 2019-09+ dialect is given. */
-    g_legacy_ref = 1;
+    /* The draft (and therefore g_legacy_ref / the id keyword) is normally set via
+       set_validation_draft(); default to the modern dialect. When a $schema
+       declares a known dialect, let it override so the production 2-arg API picks
+       up the right behavior even without an explicit set_validation_draft() call. */
+    Draft saved_draft = g_draft;
+    apply_draft_flags();
     const cJSON *root_schema = cJSON_GetObjectItemCaseSensitive(schema, "$schema");
     if (cJSON_IsString(root_schema)) {
         const char *sv = root_schema->valuestring;
-        if (strstr(sv, "2019-09") || strstr(sv, "2020-12") ||
-            strstr(sv, "draft/next"))
-            g_legacy_ref = 0;
+        if (strstr(sv, "2020-12")) g_draft = DRAFT_2020_12;
+        else if (strstr(sv, "2019-09")) g_draft = DRAFT_2019_09;
+        else if (strstr(sv, "draft-07")) g_draft = DRAFT_7;
+        else if (strstr(sv, "draft-06")) g_draft = DRAFT_6;
+        else if (strstr(sv, "draft-04")) g_draft = DRAFT_4;
+        else if (strstr(sv, "draft-03")) g_draft = DRAFT_3;
+        apply_draft_flags();
     }
 
-    const cJSON *root_id = cJSON_GetObjectItemCaseSensitive(schema, "$id");
+    const cJSON *root_id = cJSON_GetObjectItemCaseSensitive(schema, id_keyword());
     const char *root_base = cJSON_IsString(root_id) ? root_id->valuestring : "";
     register_ids(schema, "");
 
@@ -1102,5 +1183,7 @@ int validate_json_schema(const char *json, const char *schema_str) {
 #ifdef ENABLE_HTTP
     cleanup_remote();
 #endif
+    g_draft = saved_draft;
+    apply_draft_flags();
     return result;
 }

@@ -143,7 +143,7 @@ async function runTestFile(draft: Draft, keyword: string): Promise<KeywordResult
   const testFile = path.join(SPEC_ROOT, draft, `${keyword}.json`);
   const content = await Bun.file(testFile).text();
 
-  const proc = Bun.spawn([RUNNER_BIN], {
+  const proc = Bun.spawn([RUNNER_BIN, draft], {
     stdin: new Blob([content]),
     stdout: 'pipe',
     stderr: 'pipe',

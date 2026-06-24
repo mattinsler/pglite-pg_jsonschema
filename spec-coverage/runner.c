@@ -4,6 +4,7 @@
 #include <string.h>
 
 extern int validate_json_schema(const char *json, const char *schema);
+extern void set_validation_draft(const char *draft);
 
 static char *read_stdin(void) {
     size_t cap = 4096, len = 0;
@@ -17,7 +18,9 @@ static char *read_stdin(void) {
     return buf;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    set_validation_draft(argc > 1 ? argv[1] : NULL);
+
     char *input = read_stdin();
     cJSON *suites = cJSON_Parse(input);
     free(input);
