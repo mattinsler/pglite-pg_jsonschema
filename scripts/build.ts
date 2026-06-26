@@ -102,6 +102,32 @@ await Bun.write(
     `};\n`
 );
 
+// Build the optional `./drizzle` subpath export: a JS bundle (packages kept
+// external) plus its type declarations, so consumers on plain Node can use it
+// without a TypeScript-aware bundler.
+const drizzleSrc = path.resolve('src/drizzle.ts');
+const drizzleJs = await run('bun', [
+  'build',
+  drizzleSrc,
+  '--target=node',
+  '--format=esm',
+  '--packages=external',
+  '--outfile',
+  path.join(outDir, 'drizzle.js'),
+]);
+if (drizzleJs.exitCode !== 0) {
+  console.error('Failed to build dist/drizzle.js:');
+  console.error(drizzleJs.stderr);
+  process.exit(1);
+}
+
+const drizzleDts = await run('tsc', ['-p', path.resolve('tsconfig.build.json')]);
+if (drizzleDts.exitCode !== 0) {
+  console.error('Failed to emit dist/drizzle.d.ts:');
+  console.error(drizzleDts.stdout || drizzleDts.stderr);
+  process.exit(1);
+}
+
 const tarDir = path.join(outDir, '.tar-staging');
 const shareDir = path.join(tarDir, 'share', 'postgresql', 'extension');
 const libDir = path.join(tarDir, 'lib', 'postgresql');

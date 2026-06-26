@@ -1,12 +1,40 @@
 {
   "name": "pglite-pg_jsonschema",
-  "description": "PGlite extension: pg_jsonschema",
+  "description": "PGlite extension: pg_jsonschema — validate JSON/JSONB against JSON Schema in CHECK constraints",
   "version": "0.8.0",
-  "private": true,
+  "license": "MIT",
+  "author": "Matt Insler <matt.insler@gmail.com>",
+  "homepage": "https://github.com/mattinsler/pglite-pg_jsonschema#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattinsler/pglite-pg_jsonschema.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mattinsler/pglite-pg_jsonschema/issues"
+  },
+  "keywords": [
+    "pglite",
+    "postgres",
+    "postgresql",
+    "json-schema",
+    "jsonschema",
+    "pg_jsonschema",
+    "extension",
+    "wasm",
+    "drizzle",
+    "zod",
+    "validation"
+  ],
   "type": "module",
   "exports": {
-    ".": "./dist/index.js",
-    "./drizzle": "./src/drizzle.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./drizzle": {
+      "types": "./dist/drizzle.d.ts",
+      "default": "./dist/drizzle.js"
+    }
   },
   "files": [
     "dist/"
@@ -23,6 +51,19 @@
     "test": "bun test tests/",
     "typecheck": "tsc --noEmit"
   },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.3.0",
+    "drizzle-orm": ">=1.0.0",
+    "zod": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "drizzle-orm": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.3",
     "@types/bun": "1.3.14",
@@ -31,8 +72,5 @@
     "oxlint": "1.71.0",
     "typescript": "6.0.3",
     "zod": "4.4.3"
-  },
-  "peerDependencies": {
-    "drizzle-orm": ">=1.0.0"
   }
 }
