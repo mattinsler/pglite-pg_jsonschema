@@ -90,43 +90,9 @@ const pkg = assemblePackage(pipelineResult, wasmBytes, {
   version: extension.version,
 });
 
-await Bun.write(path.join(outDir, 'index.js'), pkg.entryPoint);
-await Bun.write(
-  path.join(outDir, 'index.d.ts'),
-  `export declare function ${extension.name}(): {\n` +
-    `  name: string;\n` +
-    `  setup: (pg: any, emscriptenOpts: any) => Promise<{\n` +
-    `    emscriptenOpts: any;\n` +
-    `    bundlePath: URL;\n` +
-    `  }>;\n` +
-    `};\n`
-);
-
-// Build the optional `./drizzle` subpath export: a JS bundle (packages kept
-// external) plus its type declarations, so consumers on plain Node can use it
-// without a TypeScript-aware bundler.
-const drizzleSrc = path.resolve('src/drizzle.ts');
-const drizzleJs = await run('bun', [
-  'build',
-  drizzleSrc,
-  '--target=node',
-  '--format=esm',
-  '--packages=external',
-  '--outfile',
-  path.join(outDir, 'drizzle.js'),
-]);
-if (drizzleJs.exitCode !== 0) {
-  console.error('Failed to build dist/drizzle.js:');
-  console.error(drizzleJs.stderr);
-  process.exit(1);
-}
-
-const drizzleDts = await run('tsc', ['-p', path.resolve('tsconfig.build.json')]);
-if (drizzleDts.exitCode !== 0) {
-  console.error('Failed to emit dist/drizzle.d.ts:');
-  console.error(drizzleDts.stdout || drizzleDts.stderr);
-  process.exit(1);
-}
+// The JS entry points (dist/index.js, dist/drizzle.js) and their .d.ts files are
+// produced by tsdown (see tsdown.config.ts); this script only emits the compiled
+// WASM bundle. `pkg.bundle` still carries the control file and setup SQL.
 
 const tarDir = path.join(outDir, '.tar-staging');
 const shareDir = path.join(tarDir, 'share', 'postgresql', 'extension');

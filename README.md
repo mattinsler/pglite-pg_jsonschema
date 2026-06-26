@@ -104,8 +104,8 @@ Requires [Bun](https://bun.sh) and the [Emscripten SDK](https://emscripten.org) 
 ```sh
 mise install        # installs bun + emsdk pinned in mise.toml
 bun install
-bun run build        # compiles the C validator to WASM and assembles dist/
-bun run test         # runs the extension + drizzle test suites
+bun run build        # tsdown bundles JS + types, then the C validator compiles to WASM
+bun run test         # runs the test suites under both Bun and Node (test:bun / test:node)
 bun run spec-coverage # runs the JSON Schema Test Suite against the validator
 ```
 
